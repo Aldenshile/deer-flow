@@ -2501,6 +2501,11 @@ Web chats accept direct model choices such as “ask MODEL to handle this”, �
 
 When a sub-agent ends with `return_direct=True` tools, including tools contributed by extension middleware, their outputs are returned in tool-call order. A failed tool marks the task as failed while preserving the batch outputs.
 
+Interrupted sub-agents can use `resume_task_id` while their histories remain in
+the process-local recovery registry. A type mismatch or unusable history is
+rejected before the source task is superseded or cancelled, so a corrected
+request can retry recovery.
+
 Ordinary `task` calls accept `context_mode="isolated"` (default) or
 `context_mode="snapshot"`. Isolated tasks receive their delegated prompt as
 before. Snapshot tasks also receive the parent's retained conversation and

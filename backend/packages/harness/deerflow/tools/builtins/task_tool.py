@@ -1055,12 +1055,13 @@ async def task_tool(
     if resume_task_id:
         from deerflow.subagents.recovery import (
             extract_resumable_messages,
+            get_resumable_subagent_task,
             supersede_and_claim_resumable_task,
         )
 
         try:
-            previous_result = supersede_and_claim_resumable_task(resume_task_id)
-            if previous_result is None:
+            previous_result = get_resumable_subagent_task(resume_task_id)
+            if previous_result is None or previous_result.is_superseded:
                 return _task_result_command(
                     tool_call_id=tool_call_id,
                     status="failed",
@@ -1078,6 +1079,13 @@ async def task_tool(
                     tool_call_id=tool_call_id,
                     status="failed",
                     error=f"Cannot resume subagent: task '{resume_task_id}' has no recoverable message history.",
+                )
+            # Rejected requests must leave the source task available for retry.
+            if supersede_and_claim_resumable_task(previous_result.task_id) is None:
+                return _task_result_command(
+                    tool_call_id=tool_call_id,
+                    status="failed",
+                    error=f"Cannot resume subagent: task '{resume_task_id}' is no longer available or has already been superseded.",
                 )
             logger.info(f"[trace={trace_id}] Resuming subagent from task {resume_task_id} with {len(initial_messages)} sanitized messages")
         except Exception as exc:

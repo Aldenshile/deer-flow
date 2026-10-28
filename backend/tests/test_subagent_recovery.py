@@ -595,3 +595,106 @@ def test_task_result_command_surfaces_resume_task_id():
     msg = cmd.update["messages"][0]
     assert msg.content == "Task failed. Error: subagent crashed"
     assert msg.additional_kwargs.get("resume_task_id") == "exec-fail-123"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("park_source", [False, True], ids=["active", "held"])
+@pytest.mark.parametrize("rejection", ["type_mismatch", "empty_history", "invalid_history"])
+async def test_rejected_resume_preserves_source_for_corrected_retry(monkeypatch, _setup_executor_classes, park_source, rejection):
+    classes = _setup_executor_classes
+    executor_module = importlib.import_module("deerflow.subagents.executor")
+    task_module = importlib.import_module("deerflow.tools.builtins.task_tool")
+    status = classes["SubagentStatus"]
+    source = classes["SubagentResult"](
+        task_id="rejected-resume-source",
+        external_task_id="rejected-resume-call",
+        trace_id="resume-rejection",
+        status=status.FAILED if park_source else status.RUNNING,
+        initial_task=None if rejection == "empty_history" else "Original task",
+        subagent_type="general-purpose",
+    )
+    if rejection == "invalid_history":
+        source.ai_messages = [42]
+    with classes["_background_tasks_lock"]:
+        classes["_background_tasks"][source.task_id] = source
+    if park_source:
+        executor_module.cleanup_background_task(source.task_id)
+    resume_id = source.external_task_id if park_source else source.task_id
+    admitted_histories = []
+
+    class ResumedExecutor:
+        def __init__(self, **kwargs):
+            admitted_histories.append(kwargs["initial_messages"])
+
+        def execute_async(self, prompt, task_id=None):
+            return "corrected-resume-execution"
+
+    completed = classes["SubagentResult"](
+        task_id="corrected-resume-execution",
+        trace_id="resume-completed",
+        status=status.COMPLETED,
+        result="Recovered task completed",
+    )
+    monkeypatch.setattr(task_module, "SubagentStatus", status)
+    monkeypatch.setattr(task_module, "SubagentExecutor", ResumedExecutor)
+    monkeypatch.setattr(task_module, "get_available_subagent_names", lambda **kwargs: ["general-purpose", "bash"])
+    monkeypatch.setattr(task_module, "is_host_bash_allowed", lambda *args: True)
+    monkeypatch.setattr("deerflow.tools.get_available_tools", lambda **kwargs: [])
+    monkeypatch.setattr(task_module, "get_background_task_result", lambda _: completed)
+    monkeypatch.setattr(task_module, "get_stream_writer", lambda: lambda _event: None)
+    runtime = SimpleNamespace(
+        config={"metadata": {"model_name": "mock-model", "trace_id": "resume-rejection"}},
+        context={"thread_id": "resume-thread"},
+        state={},
+    )
+    coroutine = task_module.task_tool.coroutine
+    try:
+        rejected = await coroutine(
+            runtime=runtime,
+            prompt="continue",
+            subagent_type="bash" if rejection == "type_mismatch" else "general-purpose",
+            tool_call_id="rejected-resume",
+            resume_task_id=resume_id,
+        )
+        message = rejected.update["messages"][0]
+        assert message.additional_kwargs["subagent_status"] == "failed"
+        assert {
+            "type_mismatch": "does not match requested",
+            "empty_history": "no recoverable message history",
+            "invalid_history": "Expected BaseMessage or dict",
+        }[rejection] in message.content
+        assert not source.is_superseded
+        assert not source.cancel_event.is_set()
+        assert get_resumable_subagent_task(resume_id) is source
+        assert admitted_histories == []
+
+        source.initial_task = "Original task"
+        source.ai_messages = []
+        corrected = await coroutine(
+            runtime=runtime,
+            prompt="continue",
+            subagent_type="general-purpose",
+            tool_call_id="corrected-resume",
+            resume_task_id=resume_id,
+        )
+        assert corrected.update["messages"][0].additional_kwargs["subagent_status"] == "completed"
+        assert source.is_superseded
+        assert source.cancel_event.is_set() is (not park_source)
+        assert len(admitted_histories) == 1
+        assert [message.content for message in admitted_histories[0]] == ["Original task"]
+
+        duplicate = await coroutine(
+            runtime=runtime,
+            prompt="continue",
+            subagent_type="general-purpose",
+            tool_call_id="duplicate-resume",
+            resume_task_id=resume_id,
+        )
+        assert duplicate.update["messages"][0].additional_kwargs["subagent_status"] == "failed"
+        assert len(admitted_histories) == 1
+    finally:
+        with classes["_background_tasks_lock"]:
+            classes["_background_tasks"].pop(source.task_id, None)
+        with executor_module._resumable_tasks_lock:
+            executor_module._resumable_tasks.pop(source.task_id, None)
+            executor_module._resumable_tasks.pop(source.external_task_id, None)
